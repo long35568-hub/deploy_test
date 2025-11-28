@@ -12,6 +12,9 @@ import json
 import base64
 import requests
 import hashlib
+from datetime import datetime, timedelta
+
+timestamp = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
 
 # Thử import joblib, nếu không có thì dùng pickle
 try:
@@ -104,7 +107,7 @@ def upload_db_to_github():
         if put.status_code in (200, 201):
             st.session_state["github_last_db_hash"] = current_hash
             # Thông báo nhẹ nhàng (dùng st.success để hiện tại)
-            st.success("📤 Database đã được đồng bộ lên GitHub.")
+            # st.success("📤 Database đã được đồng bộ lên GitHub.")
             return True
         else:
             # Show response message for debugging
@@ -500,7 +503,7 @@ with tab1:
                 if prediction is not None:
                     # Lưu vào database
                     new_email = {
-                        'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'Timestamp': (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S"),
                         'From': from_email,
                         'To': to_email,
                         'Subject': subject,
@@ -612,7 +615,7 @@ with tab2:
                         
                         # Lưu vào database
                         new_email = {
-                            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'Timestamp': (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S"),
                             'From': row.get('From', 'uploaded@csv.com'),
                             'To': row.get('To', 'system@example.com'),
                             'Subject': row['Subject'],
