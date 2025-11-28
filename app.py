@@ -8,6 +8,10 @@ from pathlib import Path
 import os
 import sys
 import io
+import json
+import base64
+import requests
+import hashlib
 
 # Thử import joblib, nếu không có thì dùng pickle
 try:
@@ -25,7 +29,98 @@ st.set_page_config(
     layout="wide"
 )
 
+# ------------------------------------------------------------
+# GitHub sync helpers
+# ------------------------------------------------------------
+def _compute_file_hash(path: str) -> str:
+    """Tính MD5 hash nhanh cho file (dùng để kiểm tra thay đổi)."""
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except FileNotFoundError:
+        return ""
+
+def upload_db_to_github():
+    """
+    Đồng bộ file emails.db lên GitHub repo sử dụng PAT lưu trong st.secrets.
+    Yêu cầu trong Streamlit Secrets có: GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO, GITHUB_FILE
+    """
+    db_path = "emails.db"
+    if not os.path.exists(db_path):
+        st.info("ℹ️ Không tìm thấy emails.db để đồng bộ.")
+        return False
+
+    # Kiểm tra secrets
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        username = st.secrets["GITHUB_USERNAME"]
+        repo = st.secrets["GITHUB_REPO"]
+        filename = st.secrets.get("GITHUB_FILE", "emails.db")
+    except Exception as e:
+        st.warning("⚠️ GitHub secrets chưa cấu hình. Bỏ qua đồng bộ lên GitHub.")
+        return False
+
+    # Tránh push nếu file không đổi (session cache)
+    current_hash = _compute_file_hash(db_path)
+    last_hash = st.session_state.get("github_last_db_hash")
+    if last_hash == current_hash:
+        # không thay đổi
+        return True
+
+    api_url = f"https://api.github.com/repos/{username}/{repo}/contents/{filename}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+    # đọc file và encode base64
+    with open(db_path, "rb") as f:
+        content_bytes = f.read()
+    encoded = base64.b64encode(content_bytes).decode()
+
+    # Lấy SHA hiện tại (nếu file đã tồn tại trên repo)
+    try:
+        r = requests.get(api_url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        elif r.status_code == 404:
+            sha = None
+        else:
+            st.warning(f"⚠️ Lỗi khi kiểm tra file trên GitHub: {r.status_code}")
+            sha = None
+    except Exception as e:
+        st.warning(f"⚠️ Lỗi kết nối GitHub: {str(e)}")
+        return False
+
+    payload = {
+        "message": f"Auto-update emails.db from Streamlit at {datetime.utcnow().isoformat()}Z",
+        "content": encoded
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        put = requests.put(api_url, headers=headers, data=json.dumps(payload), timeout=30)
+        if put.status_code in (200, 201):
+            st.session_state["github_last_db_hash"] = current_hash
+            # Thông báo nhẹ nhàng (dùng st.success để hiện tại)
+            st.success("📤 Database đã được đồng bộ lên GitHub.")
+            return True
+        else:
+            # Show response message for debugging
+            try:
+                err = put.json()
+            except:
+                err = put.text
+            st.warning(f"⚠️ Không thể push lên GitHub ({put.status_code}): {err}")
+            return False
+    except Exception as e:
+        st.warning(f"⚠️ Lỗi khi push lên GitHub: {str(e)}")
+        return False
+
+# ------------------------------------------------------------
 # CSS
+# ------------------------------------------------------------
 st.markdown("""
 <style>
     .main-header {
@@ -110,7 +205,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ------------------------------------------------------------
 # Database functions
+# ------------------------------------------------------------
 def init_database():
     """Khởi tạo SQLite database"""
     conn = sqlite3.connect('emails.db', check_same_thread=False)
@@ -143,7 +240,7 @@ def load_emails_from_db(conn):
                 'timestamp': 'Timestamp'
             })
         return df
-    except:
+    except Exception:
         return pd.DataFrame(columns=['Timestamp', 'From', 'To', 'Subject', 'Content', 'Prediction', 'Confidence'])
 
 def save_email_to_db(conn, email_data):
@@ -185,7 +282,9 @@ def create_csv_template():
 if 'db_conn' not in st.session_state:
     st.session_state.db_conn = init_database()
 
+# ------------------------------------------------------------
 # Load model
+# ------------------------------------------------------------
 @st.cache_resource
 def load_trained_model():
     """Load model Decision Tree với joblib"""
@@ -273,7 +372,13 @@ def predict_with_trained_model(email_text, model, feature_names):
         confidence = None
         if hasattr(model, 'predict_proba'):
             proba = model.predict_proba(features_reshaped)[0]
-            confidence = proba[prediction] * 100
+            # proba is array indexed by class label order: find index of predicted class
+            try:
+                pred_index = list(model.classes_).index(prediction)
+                confidence = proba[pred_index] * 100
+            except Exception:
+                # fallback: max probability
+                confidence = proba.max() * 100
         
         return int(prediction), confidence, features
         
@@ -406,6 +511,9 @@ with tab1:
                     
                     save_email_to_db(st.session_state.db_conn, new_email)
                     
+                    # Đồng bộ lên GitHub (nếu secrets có cấu hình)
+                    upload_db_to_github()
+                    
                     st.success("✅ Email đã được gửi và phân tích!")
                     
                     if prediction == 1:
@@ -521,6 +629,9 @@ with tab2:
                             'Confidence': f"{confidence:.1f}%" if confidence else "N/A"
                         })
                     
+                    # Sau khi hoàn thành batch, đồng bộ 1 lần
+                    upload_db_to_github()
+                    
                     status_text.text("✅ Hoàn thành!")
                     
                     # Hiển thị kết quả
@@ -615,6 +726,8 @@ with tab3:
             if st.button("🗑️ Xóa toàn bộ", key="delete_all_db", use_container_width=True):
                 if st.session_state.get('confirm_delete', False):
                     clear_database(st.session_state.db_conn)
+                    # Đồng bộ lên GitHub (xóa file trên repo sẽ được ghi mới - file rỗng DB)
+                    upload_db_to_github()
                     st.session_state.confirm_delete = False
                     st.success("✅ Đã xóa toàn bộ database!")
                     # Không dùng st.rerun() để tránh quay về tab đầu tiên
